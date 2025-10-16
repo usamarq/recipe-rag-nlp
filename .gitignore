@@ -1,0 +1,26 @@
+# --- Data Files ---
+# Ignore the data folder and all its contents
+data/
+*.csv
+
+# --- Python Virtual Environment ---
+# Common names for virtual environment folders
+venv/
+env/
+.venv/
+
+# --- Python Cache ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# --- Jupyter Notebook ---
+# Ignore notebook checkpoint files
+.ipynb_checkpoints/
+
+# --- IDE/Editor Specific ---
+# VSCode
+.vscode/
+# PyCharm
+.idea/
