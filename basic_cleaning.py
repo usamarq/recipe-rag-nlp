@@ -61,7 +61,28 @@ def basic_cleaning(input_path: str, output_path: str):
     print("Converted numeric columns safely (invalid values → NaN)")
 
     # --------------------------------------------------
-    # 5. Apply simple thresholds to remove absurd values
+    # 5. Drop rows with zero or missing nutritional values
+    # --------------------------------------------------
+    before = len(df)
+    if all(col in df.columns for col in ["calories_cal", "protein_g"]):
+        df = df[(df["calories_cal"] > 0) & (df["protein_g"] > 0)]
+        print(f"Removed {before - len(df)} rows with zero or missing nutrition values")
+
+    # --------------------------------------------------
+    # 6. Remove non-food or decorative entries
+    # --------------------------------------------------
+    if "title" in df.columns:
+        before = len(df)
+        non_food_keywords = [
+            "napkin", "serviette", "folding", "table", "decor", "arrangement",
+            "centerpiece", "placemat", "wrapping", "basket", "flower", "bouquet"
+        ]
+        pattern = "|".join(non_food_keywords)
+        df = df[~df["title"].str.lower().str.contains(pattern, na=False)]
+        print(f"Removed {before - len(df)} non-food or decorative entries")
+
+    # --------------------------------------------------
+    # 7. Apply simple thresholds to remove absurd values
     # --------------------------------------------------
     before = len(df)
     if all(col in df.columns for col in ["calories_cal", "protein_g", "sodium_mg"]):
@@ -75,7 +96,16 @@ def basic_cleaning(input_path: str, output_path: str):
     print(f"Shape after numeric filtering: {df.shape}")
 
     # --------------------------------------------------
-    # 6. Save cleaned dataset
+    # 8. Drop empty text entries (title, ingredients)
+    # --------------------------------------------------
+    text_cols = ["title", "ingredients"]
+    before = len(df)
+    df.dropna(subset=[c for c in text_cols if c in df.columns], inplace=True)
+    df = df[(df["title"].str.strip() != "") & (df["ingredients"].str.strip() != "")]
+    print(f"Removed {before - len(df)} rows with missing text fields")
+
+    # --------------------------------------------------
+    # 9. Save cleaned dataset
     # --------------------------------------------------
     df.to_csv(output_path, index=False)
     print("\n✅ Basic cleaning complete.")
