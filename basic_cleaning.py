@@ -20,7 +20,7 @@ def clean_column_name(name: str) -> str:
 
 def basic_cleaning(input_path: str, output_path: str):
     print("=== Loading raw dataset ===")
-    df = pd.read_csv(input_path, low_memory=False)
+    df = pd.read_csv(input_path, low_memory=True)
     print(f"Initial shape: {df.shape}")
 
     # --------------------------------------------------
