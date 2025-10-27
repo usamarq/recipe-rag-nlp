@@ -23,32 +23,42 @@ stop_words = set(stopwords.words('english'))
 
 def preprocess_text(text: str):
     """
-    Perform standard NLP cleaning steps:
-    - Lowercasing
-    - Keep only letters and spaces
-    - Tokenization
-    - Stopword removal
-    - Lemmatization
-    Returns a cleaned string (joined tokens).
+    Cleans and tokenizes recipe text while preserving meaningful numeric values.
+    
+    Steps:
+        • Lowercase
+        • Keep letters, digits, and spaces
+        • Merge numbers with nearby units (e.g. "500 g" → "500g")
+        • Tokenize
+        • Remove stopwords
+        • Lemmatize
+    Returns a list of cleaned tokens.
     """
     if not isinstance(text, str):
-        return ""
+        return []
 
-    # Lowercase + remove non-letter characters
-    text = re.sub(r'[^a-zA-Z\s]', ' ', text.lower())
+    # Keep only letters, digits, and spaces (remove punctuation)
+    text = re.sub(r'[^a-zA-Z0-9\s]', ' ', text).lower()
 
-    # Tokenize
+    # Merge numbers and their units (e.g. 500 g → 500g)
+    text = re.sub(
+        r'(\d+)\s*(g|gram|ml|kg|tbsp|tsp|cup|cups|teaspoon|tablespoon|minute|min|hour|hr|cal|kcal)',
+        r'\1\2',
+        text
+    )
+
+    # Normalize multiple spaces
+    text = re.sub(r'\s+', ' ', text).strip()
+
     tokens = word_tokenize(text)
 
-    # Remove stopwords and lemmatize
-    cleaned_tokens = [
+    # Lemmatize & remove stopwords
+    cleaned = [
         lemmatizer.lemmatize(tok)
         for tok in tokens
         if tok not in stop_words and len(tok) > 1
     ]
-
-    # Join back into a single string for easy TF-IDF or embedding use
-    return " ".join(cleaned_tokens)
+    return cleaned
 
 
 # -------------------------------------------------
@@ -56,7 +66,7 @@ def preprocess_text(text: str):
 # -------------------------------------------------
 def text_preprocess_dataset(input_path: str, output_path: str):
     print("=== Loading cleaned dataset ===")
-    df = pd.read_csv(input_path)
+    df = pd.read_csv(input_path, low_memory=False)
     print(f"Initial dataset shape: {df.shape}")
 
     # --- Define columns to preprocess ---
@@ -74,19 +84,22 @@ def text_preprocess_dataset(input_path: str, output_path: str):
         df[f'processed_{col}'] = df[col].astype(str).apply(preprocess_text)
 
     # --- Generate quick statistics ---
-    df['num_ingredient_tokens'] = df['processed_ingredients'].apply(
-        lambda x: len(x.split()) if isinstance(x, str) else 0
-    )
-    df['num_tag_tokens'] = df['processed_tags'].apply(
-        lambda x: len(x.split()) if isinstance(x, str) else 0
-    )
+    print("\n=== Generating statistics ===")
+    stat_cols = ['processed_title', 'processed_ingredients', 'processed_directions', 'processed_tags']
+    for col in stat_cols:
+        if col in df.columns:
+            df[f'num_{col}_tokens'] = df[col].apply(lambda x: len(x) if isinstance(x, list) else 0)
+            print(f"Average tokens in {col}: {df[f'num_{col}_tokens'].mean():.2f}")
+
+    # --- Show sample rows for verification ---
+    print("\nSample processed text:")
+    sample_cols = ['title', 'processed_title', 'ingredients', 'processed_ingredients']
+    print(df[sample_cols].head(3))
 
     # --- Summary report ---
     print("\n=== SUMMARY REPORT ===")
     new_columns = set(df.columns) - original_columns
     print(f"New columns added: {sorted(list(new_columns))}")
-    print(f"Average ingredient tokens: {df['num_ingredient_tokens'].mean():.2f}")
-    print(f"Average tag tokens: {df['num_tag_tokens'].mean():.2f}")
     print(f"Final dataset shape: {df.shape}")
 
     # --- Save results ---
