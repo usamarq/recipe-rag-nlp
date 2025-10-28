@@ -33,17 +33,25 @@ def build_index_and_metadata(data_path="data/hummus_recipes_preprocessed.csv",
     print(f"Loading full data for indexing from: {data_path}")
     # Define columns needed for indexing and metadata
     text_cols = ["processed_title", "processed_ingredients", "processed_tags", "processed_directions"]
-    metadata_cols = ["recipe_id", "title", "calories_cal", "totalfat_g", "protein_g"] # Add more metadata if needed
+    # --- *** MODIFICATION: Added 'processed_tags' to metadata_cols *** ---
+    metadata_cols = ["recipe_id", "title", "calories_cal", "totalfat_g", "protein_g",
+                     "duration", "saturatedfat_g", "cholesterol_mg", "sodium_mg", # Added more numeric cols
+                     "totalcarbohydrate_g", "dietaryfiber_g", "sugars_g",
+                     "ingredients_sizes", "direction_size", # Added size cols
+                     "processed_tags"] # Ensure tags column is included for filtering
+    # -----------------------------------------------------------------------
     try:
         # Read columns first to identify available ones
         all_cols = pd.read_csv(data_path, nrows=0).columns
         available_text_cols = [c for c in text_cols if c in all_cols]
         cols_for_metadata = [c for c in metadata_cols if c in all_cols]
-        cols_to_load = list(set(cols_for_metadata + available_text_cols)) # Ensure no duplicates
+        # Make sure essential cols are present
+        if "recipe_id" not in cols_for_metadata or "title" not in cols_for_metadata:
+             raise ValueError("Essential 'recipe_id' or 'title' missing in metadata columns.")
+        if "processed_tags" not in cols_for_metadata:
+             print("Warning: 'processed_tags' column not found in CSV. Tag filtering will not work.")
 
-        # Check for essential columns
-        if "recipe_id" not in cols_to_load or "title" not in cols_to_load:
-             raise ValueError("Missing essential 'recipe_id' or 'title' column in source file.")
+        cols_to_load = list(set(cols_for_metadata + available_text_cols)) # Ensure no duplicates
 
         df = pd.read_csv(data_path, usecols=cols_to_load, low_memory=True)
         print(f"Loaded {len(df)} recipes with columns: {list(df.columns)}")
@@ -73,9 +81,7 @@ def build_index_and_metadata(data_path="data/hummus_recipes_preprocessed.csv",
                     if isinstance(actual_tokens, list):
                         combined_tokens.extend(actual_tokens)
                 except (ValueError, SyntaxError):
-                    # Handle cases where the string is not a valid list representation
                     error_count += 1
-                    # Optionally add fallback logic, e.g., text_repr.split()
             elif isinstance(text_repr, str): # Handle plain strings (less likely)
                  combined_tokens.extend(text_repr.split())
         tokenized_docs.append(combined_tokens)
@@ -98,8 +104,11 @@ def build_index_and_metadata(data_path="data/hummus_recipes_preprocessed.csv",
     # --- Create Metadata Map (Index -> Metadata) ---
     print("Creating metadata map...")
     metadata_map = {}
+    # Use cols_for_metadata which now includes 'processed_tags'
     for idx, row in df[cols_for_metadata].iterrows():
-        metadata_map[idx] = row.to_dict()
+        # Convert row to dict, handling potential NaNs gracefully for JSON compatibility if needed later
+        meta_dict = row.replace({np.nan: None}).to_dict()
+        metadata_map[idx] = meta_dict
     del df # Free up DataFrame memory
 
     # --- Save Index and Metadata ---
@@ -198,6 +207,7 @@ def search_bm25_optimized(query: str, bm25, metadata_map, top_k=5):
             score = scores[idx]
             if score > 1e-6: # Use a small threshold instead of > 0 for floating point
                 doc_metadata = metadata_map[idx]
+                # Include relevant metadata for display
                 results.append({
                     'index': idx,
                     'recipe_id': doc_metadata.get('recipe_id', 'N/A'),
@@ -205,6 +215,7 @@ def search_bm25_optimized(query: str, bm25, metadata_map, top_k=5):
                     'calories_cal': doc_metadata.get('calories_cal', '?'),
                     'totalfat_g': doc_metadata.get('totalfat_g', '?'),
                     'protein_g': doc_metadata.get('protein_g', '?'),
+                    'processed_tags': doc_metadata.get('processed_tags', []), # Include tags if needed later
                     'bm25_score': score
                 })
         else:
@@ -213,9 +224,12 @@ def search_bm25_optimized(query: str, bm25, metadata_map, top_k=5):
 
     end_time = time.time()
     print(f"\nTop {len(results)} results found in {end_time - start_time:.4f} seconds:")
+    # Display results
+    display_cols = ['recipe_id', 'title', 'calories_cal', 'bm25_score'] # Adjust display as needed
     for rank, res in enumerate(results, 1):
-        print(f"{rank}. [ID: {res['recipe_id']}] {res['title']} "
-              f"({res['calories_cal']} cal) - Score: {res['bm25_score']:.4f}")
+        print(f"{rank}. [ID: {res.get('recipe_id','N/A')}] {res.get('title','N/A')} "
+              f"({res.get('calories_cal','?')} cal) - Score: {res.get('bm25_score', 0):.4f}")
+
 
     return results # Return list of dictionaries
 
@@ -238,8 +252,12 @@ if __name__ == "__main__":
         if not FORCE_REBUILD: print("\nCache files not found or invalid.")
         print("Attempting to build index and metadata...")
         # Delete potentially corrupted files before rebuilding
-        if os.path.exists(index_cache_path): os.remove(index_cache_path)
-        if os.path.exists(metadata_cache_path): os.remove(metadata_cache_path)
+        if os.path.exists(index_cache_path):
+            try: os.remove(index_cache_path)
+            except OSError as e: print(f"Error removing old index file: {e}")
+        if os.path.exists(metadata_cache_path):
+            try: os.remove(metadata_cache_path)
+            except OSError as e: print(f"Error removing old metadata file: {e}")
 
         bm25_model, metadata = build_index_and_metadata(data_path, index_cache_path, metadata_cache_path)
 
@@ -248,20 +266,19 @@ if __name__ == "__main__":
         print("\n--- Running Example Searches ---")
         print("-" * 30)
         search_results_1 = search_bm25_optimized(
-            "low fat chicken under 500 calories",
+            "low fat chicken under 500 calories", # This query won't be filtered by this script
             bm25_model, metadata, top_k=5
         )
         print("-" * 30)
         search_results_2 = search_bm25_optimized(
-            "high protein vegan salad",
+            "high protein vegan salad", # This query won't be filtered by this script
             bm25_model, metadata, top_k=5
         )
         print("-" * 30)
         search_results_3 = search_bm25_optimized(
-            "gluten-free pasta with tomato",
+            "gluten-free pasta with tomato", # This query won't be filtered by this script
             bm25_model, metadata, top_k=5
         )
         print("-" * 30)
     else:
         print("Failed to initialize BM25 model and metadata. Cannot perform search.")
-
