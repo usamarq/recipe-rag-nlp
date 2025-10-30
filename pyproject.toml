@@ -59,8 +59,7 @@ dependencies = [
     "wordcloud==1.9.4",
     "wrapt==1.17.3",
 
-    "langchain>=1.0.3",
+    "langchain",
     "ollama>=0.0.5",
-    "faiss-cpu>=1.7.4",
-    "nomic>=0.1.0",
+    "langchain-community",
 ]

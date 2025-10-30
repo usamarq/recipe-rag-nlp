@@ -1,512 +1,294 @@
-#!/usr/bin/env python3
-"""
-recipe_rag.py
-
-Retrieval-Augmented Generation system for recipe recommendations using:
- - Ollama LLM: llama3.1:latest
- - Ollama embeddings: nomic-embed-text:latest
- - In-memory vector store: langchain_core.vectorstores.InMemoryVectorStore
-
-Features:
- - Load recipes CSV (expects columns similar to the user's header row)
- - Create embeddings and index recipes into an in-memory vector store
- - Retrieve top-k recipes for a query with optional metadata filters (e.g., duration, tags)
- - Pass retrieved recipes as context to LLM and produce a natural language recommendation
-"""
-
-from __future__ import annotations
-
-import os
-import logging
-import time
-from dataclasses import dataclass
-from typing import List, Dict, Any, Optional, Tuple
 import pandas as pd
-import numpy as np
-from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
-
-# LangChain / Ollama related imports
-try:
-    from langchain.text_splitter import RecursiveCharacterTextSplitter
-    from langchain.prompts import PromptTemplate
-    from langchain.schema import Document
-except Exception as e:
-    raise RuntimeError("Please install langchain (and dependencies).") from e
-
-# Ollama LLM and embeddings from community wrappers — adjust import path if your environment differs
-try:
-    # Many wrappers have same names - this matches common community wrapper naming
-    from langchain_community.llms import Ollama
-    from langchain_community.embeddings import OllamaEmbeddings
-except Exception:
-    # fallback: try another import path or signal user to install langchain-community
-    raise RuntimeError("Please install langchain-community (pip install langchain-community).")
-
-# In-memory vector store requested by user
-try:
-    from langchain_core.vectorstores import InMemoryVectorStore
-except Exception:
-    # If import fails, provide informative error
-    raise RuntimeError(
-        "Could not import InMemoryVectorStore from langchain_core.vectorstores. "
-        "Make sure you have the correct langchain_core package installed or adjust the import path."
-    )
-
-# Logging
-logging.basicConfig(
-    level=os.environ.get("LOGLEVEL", "INFO"),
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
-
-# Configuration via environment variables (can be overridden)
-OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")  # default ollama local host/port
-LLM_MODEL = os.environ.get("LLM_MODEL", "llama3.1:latest")
-EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "nomic-embed-text:latest")
-VECTOR_STORE_COLLECTION = os.environ.get("VECTOR_STORE_COLLECTION", "recipes")
-EMBED_BATCH_SIZE = int(os.environ.get("EMBED_BATCH_SIZE", "16"))
+from langchain_community.embeddings import OllamaEmbeddings
+from langchain_community.llms import Ollama
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_core.documents import Document
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
+import warnings
+warnings.filterwarnings('ignore')
 
 
-@dataclass
-class RecipeDoc:
-    recipe_id: str
-    title: str
-    description: str
-    duration: Optional[int]  # minutes if available
-    tags: List[str]
-    serves: Optional[int]
-    calories_cal: Optional[float]
-    raw_row: Dict[str, Any]
-
-
-class RecipeRAG:
-    """
-    RAG system for recipe recommendation.
-    - load CSV
-    - index into InMemoryVectorStore
-    - retrieve top-k by semantic similarity with optional metadata filters
-    - generate a recommendation message with LLM
-    """
-
-    def __init__(self,
-                 csv_path: str,
-                 llm_model: str = LLM_MODEL,
-                 embedding_model: str = EMBEDDING_MODEL,
-                 ollama_host: str = OLLAMA_HOST,
-                 vectorstore: Optional[InMemoryVectorStore] = None):
+class RecipeRAGSystem:
+    def __init__(self, csv_path, embedding_model="nomic-embed-text:latest", llm_model="llama3.1:latest"):
+        """
+        Initialize the Recipe RAG System
+        
+        Args:
+            csv_path: Path to the CSV file containing recipes
+            embedding_model: Ollama embedding model name
+            llm_model: Ollama LLM model name
+        """
         self.csv_path = csv_path
-        self.llm_model = llm_model
         self.embedding_model = embedding_model
-        self.ollama_host = ollama_host
-
-        # Setup LLM & embeddings (wrap in retries for production robustness)
-        logger.info("Initializing Ollama LLM and Embeddings...")
-        self.llm = self._init_ollama_llm()
-        self.embeddings = self._init_ollama_embeddings()
-
-        # Text splitter for long fields
-        self.text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=50)
-
-        # Vector store (InMemoryVectorStore from langchain_core.vectorstores)
-        if vectorstore is None:
-            self.vectorstore = InMemoryVectorStore()  # instantiate empty and fill later
-        else:
-            self.vectorstore = vectorstore
-
-        # Keep local map of id -> metadata for easy filtering
-        self._metadata_index: Dict[str, Dict[str, Any]] = {}
-
-    def _init_ollama_llm(self):
-        # wrap in a retry decorator in case ollama server is still starting
-        @retry(wait=wait_exponential(min=1, max=10), stop=stop_after_attempt(5),
-               retry=retry_if_exception_type(Exception))
-        def _init():
-            logger.info(f"Creating Ollama LLM client (model={self.llm_model})")
-            # Ollama wrapper typically accepts model and optionally base_url
-            return Ollama(model=self.llm_model, base_url=self.ollama_host, temperature=0.1)
-        return _init()
-
-    def _init_ollama_embeddings(self):
-        @retry(wait=wait_exponential(min=1, max=10), stop=stop_after_attempt(5),
-               retry=retry_if_exception_type(Exception))
-        def _init():
-            logger.info(f"Creating Ollama embeddings client (model={self.embedding_model})")
-            return OllamaEmbeddings(model=self.embedding_model, base_url=self.ollama_host)
-        return _init()
-
-    def _row_to_recipe_doc(self, row: pd.Series) -> RecipeDoc:
-        # Handle potential column name variations and types
-        recipe_id = str(row.get("recipe_id", row.get("new_recipe_id", row.name)))
-        title = str(row.get("title", "")).strip()
-        description = str(row.get("description", "")).strip()
-        duration_raw = row.get("duration", None)
-        try:
-            duration = int(duration_raw) if pd.notnull(duration_raw) and str(duration_raw).strip() != "" else None
-        except Exception:
-            # sometimes duration might be "15 min" -> extract digits
-            import re
-            m = re.search(r"(\d+)", str(duration_raw or ""))
-            duration = int(m.group(1)) if m else None
-
-        tags_raw = row.get("tags", "")
-        if pd.isnull(tags_raw):
-            tags = []
-        else:
-            # tags may be comma separated
-            if isinstance(tags_raw, list):
-                tags = tags_raw
-            else:
-                tags = [t.strip().lower() for t in str(tags_raw).split(",") if t.strip()]
-
-        serves = None
-        try:
-            sp = row.get("serves", row.get("servingsperrecipe", None))
-            serves = int(sp) if pd.notnull(sp) and str(sp).strip() != "" else None
-        except Exception:
-            serves = None
-
-        calories = None
-        try:
-            cal = row.get("calories_cal", None)
-            calories = float(cal) if pd.notnull(cal) and str(cal).strip() != "" else None
-        except Exception:
-            calories = None
-
-        return RecipeDoc(
-            recipe_id=recipe_id,
-            title=title,
-            description=description,
-            duration=duration,
-            tags=tags,
-            serves=serves,
-            calories_cal=calories,
-            raw_row=row.to_dict()
+        self.llm_model = llm_model
+        
+        # Initialize components
+        print("Initializing embeddings...")
+        self.embeddings = OllamaEmbeddings(model=self.embedding_model)
+        
+        print("Initializing LLM...")
+        self.llm = Ollama(model=self.llm_model, temperature=0.7)
+        
+        # Load and process data
+        print("Loading recipe data...")
+        self.df = pd.read_csv(csv_path)
+        self.process_data()
+        
+        # Create vector store
+        print("Creating vector store...")
+        self.vector_store = self.create_vector_store()
+        
+        print("RAG System initialized successfully!")
+    
+    def process_data(self):
+        """Clean and process the recipe data"""
+        # Handle missing values
+        self.df['description'] = self.df['description'].fillna('')
+        self.df['tags'] = self.df['tags'].fillna('')
+        self.df['duration'] = pd.to_numeric(self.df['duration'], errors='coerce')
+        self.df['calories_cal'] = pd.to_numeric(self.df['calories_cal'], errors='coerce')
+        self.df['protein_g'] = pd.to_numeric(self.df['protein_g'], errors='coerce')
+        
+        # Drop rows with missing critical data
+        self.df = self.df.dropna(subset=['title', 'duration'])
+    
+    def create_document_text(self, row):
+        """Create a rich text representation of a recipe for embedding"""
+        doc_text = f"""
+Title: {row['title']}
+Description: {row['description']}
+Duration: {row['duration']} minutes
+Tags: {row['tags']}
+Ingredients: {row['ingredients'] if pd.notna(row['ingredients']) else 'N/A'}
+Calories: {row['calories_cal']} cal
+Protein: {row['protein_g']}g
+Serves: {row['serves']}
+Directions: {row['directions'][:200] if pd.notna(row['directions']) else 'N/A'}...
+        """.strip()
+        return doc_text
+    
+    def create_vector_store(self):
+        """Create vector store from recipe data"""
+        documents = []
+        
+        for idx, row in self.df.iterrows():
+            # Create document text
+            doc_text = self.create_document_text(row)
+            
+            # Create metadata
+            metadata = {
+                'recipe_id': str(row['recipe_id']) if pd.notna(row['recipe_id']) else str(idx),
+                'title': str(row['title']),
+                'duration': float(row['duration']) if pd.notna(row['duration']) else 0,
+                'tags': str(row['tags']),
+                'calories': float(row['calories_cal']) if pd.notna(row['calories_cal']) else 0,
+                'protein': float(row['protein_g']) if pd.notna(row['protein_g']) else 0,
+                'serves': str(row['serves']) if pd.notna(row['serves']) else 'N/A',
+            }
+            
+            # Create document
+            doc = Document(page_content=doc_text, metadata=metadata)
+            documents.append(doc)
+        
+        # Create vector store
+        vector_store = InMemoryVectorStore.from_documents(
+            documents=documents,
+            embedding=self.embeddings
         )
-
-    def load_csv(self) -> List[RecipeDoc]:
-        """Load recipes CSV and convert each row to a RecipeDoc"""
-        logger.info("Loading CSV: %s", self.csv_path)
-        df = pd.read_csv(self.csv_path, dtype=str).fillna("")
-        docs = []
-        for idx, row in df.iterrows():
-            rd = self._row_to_recipe_doc(row)
-            docs.append(rd)
-        logger.info("Loaded %d recipes", len(docs))
-        return docs
-
-    def _doc_to_langchain_document(self, recipe: RecipeDoc) -> Document:
-        """Create a langchain Document combining title, description, ingredients, directions etc."""
-        # Form body text for embedding & chunking
-        # We include title, description, duration, tags, and key nutritional info
-        meta = {
-            "recipe_id": recipe.recipe_id,
-            "title": recipe.title,
-            "duration": recipe.duration,
-            "tags": recipe.tags,
-            "serves": recipe.serves,
-            "calories": recipe.calories_cal
-        }
-
-        body_pieces = [f"Title: {recipe.title}"]
-        if recipe.description:
-            body_pieces.append(f"Description: {recipe.description}")
-        if recipe.duration is not None:
-            body_pieces.append(f"Duration: {recipe.duration} minutes")
-        if recipe.tags:
-            body_pieces.append(f"Tags: {', '.join(recipe.tags)}")
-        # include serialized raw row for completeness
-        body_pieces.append(f"RawRow: {recipe.raw_row}")
-
-        text = "\n\n".join(body_pieces)
-        return Document(page_content=text, metadata=meta)
-
-    def index_recipes(self, recipes: List[RecipeDoc], overwrite: bool = True) -> int:
+        
+        return vector_store
+    
+    def retrieve_recipes(self, query, k=5, filters=None):
         """
-        Create embeddings and index recipes into the InMemoryVectorStore.
-        Returns number of indexed documents.
+        Retrieve top-k recipes based on query
+        
+        Args:
+            query: User query string
+            k: Number of recipes to retrieve
+            filters: Dictionary of filters (e.g., {'max_duration': 20, 'tags': 'vegetarian'})
+        
+        Returns:
+            List of retrieved documents
         """
-        if overwrite:
-            # Reinitialize empty vector store
-            logger.info("Clearing and recreating InMemoryVectorStore")
-            self.vectorstore = InMemoryVectorStore()
-
-        # Convert to langchain Documents
-        documents = [self._doc_to_langchain_document(r) for r in recipes]
-        logger.info("Converting %d recipes to documents and creating embeddings", len(documents))
-
-        # Create embeddings in batches and add to vector store
-        added = 0
-        batch = []
-        for i, doc in enumerate(documents, start=1):
-            batch.append(doc)
-            if len(batch) >= EMBED_BATCH_SIZE or i == len(documents):
-                # compute embeddings via the embeddings object
-                try:
-                    # Many LangChain vectorstores accept from_documents with embeddings parameter
-                    if hasattr(self.vectorstore, "from_documents"):
-                        # Some variants are classmethods; handle both
-                        try:
-                            # attempt to use instance method if exists
-                            self.vectorstore = InMemoryVectorStore.from_documents(batch, embedding=self.embeddings)
-                        except Exception:
-                            # fallback to classmethod style
-                            self.vectorstore = InMemoryVectorStore.from_documents(batch, embedding=self.embeddings)
-                    else:
-                        # Generic add_documents approach (some vectorstores implement add_documents)
-                        if hasattr(self.vectorstore, "add_documents"):
-                            self.vectorstore.add_documents(batch, embedding=self.embeddings)
-                        else:
-                            # As ultimate fallback: compute embeddings and store in a naive store
-                            raise RuntimeError("InMemoryVectorStore API not compatible in this environment.")
-                    added += len(batch)
-                    logger.info("Indexed batch size=%d", len(batch))
-                except Exception as e:
-                    logger.exception("Failed to index batch: %s", e)
-                    raise
-                finally:
-                    batch = []
-
-        # build metadata index
-        self._metadata_index = {}
-        try:
-            # if vectorstore exposes docs or similar
-            if hasattr(self.vectorstore, "documents"):
-                # If the store exposes docs, iterate
-                for d in getattr(self.vectorstore, "documents", []):
-                    rid = d.metadata.get("recipe_id", None)
-                    if rid:
-                        self._metadata_index[str(rid)] = d.metadata
-            else:
-                # fallback: iterate input recipes
-                for r in recipes:
-                    self._metadata_index[str(r.recipe_id)] = {
-                        "title": r.title,
-                        "duration": r.duration,
-                        "tags": r.tags,
-                        "serves": r.serves,
-                        "calories": r.calories_cal
-                    }
-        except Exception:
-            logger.debug("Could not extract docs from vectorstore; metadata index built from input recipes")
-
-        logger.info("Indexing complete. Total indexed: %d", added)
-        return added
-
-    def _filter_candidates(self, candidates: List[Document], filters: Dict[str, Any]) -> List[Document]:
-        """
-        Apply simple metadata filter to candidate documents.
-        Supported filters: duration_lt (minutes), tag_in (list or str), vegetarian_bool, max_calories
-        """
-        if not filters:
-            return candidates
-
-        out = []
-        for doc in candidates:
-            meta = doc.metadata or {}
-            keep = True
-
-            duration_lt = filters.get("duration_lt")
-            if duration_lt is not None:
-                d = meta.get("duration")
-                if d is None or (isinstance(d, (int, float)) and d >= duration_lt) or (isinstance(d, str) and d and int(d) >= duration_lt):
-                    keep = False
-
-            tag_in = filters.get("tag_in")
-            if tag_in and keep:
-                tags = meta.get("tags", [])
-                if isinstance(tag_in, str):
-                    tag_in_vals = [tag_in.lower()]
-                else:
-                    tag_in_vals = [t.lower() for t in tag_in]
-                # if none of the tag_in values are present, drop
-                if not any(t.lower() in tags for t in tag_in_vals):
-                    keep = False
-
-            max_calories = filters.get("max_calories")
-            if max_calories and keep:
-                cal = meta.get("calories")
-                if cal is None or (isinstance(cal, (int, float)) and cal > max_calories):
-                    keep = False
-
-            if keep:
-                out.append(doc)
-        return out
-
-    def retrieve(self,
-                 query: str,
-                 top_k: int = 5,
-                 filters: Optional[Dict[str, Any]] = None) -> List[Tuple[Document, float]]:
-        """
-        Retrieve top-k semantically similar recipes for query.
-        Returns list of (Document, score) sorted by descending similarity score.
-        """
-        logger.info("Embedding query and searching top_k=%d", top_k)
-        # Compute query embedding
-        query_embedding = self.embeddings.embed_query(query)
-
-        # Most langchain stores expose similarity_search_by_vector or similar
-        # We'll try several common method names for compatibility
-        search_methods = [
-            "similarity_search_by_vector",
-            "similarity_search_with_score",
-            "similarity_search",
-            "search"
-        ]
-
-        results: List[Tuple[Document, float]] = []
-        for method_name in search_methods:
-            if hasattr(self.vectorstore, method_name):
-                method = getattr(self.vectorstore, method_name)
-                try:
-                    # Different signatures: try common ones
-                    out = None
-                    try:
-                        out = method(query_embedding, k=top_k)
-                    except TypeError:
-                        # maybe expects (query, k) or (query, k, ...) -> fallback
-                        out = method(query, k=top_k)
-                    # normalize to list of (doc, score)
-                    if out:
-                        # many returns are list[Document] or list[(Document, score)]
-                        if isinstance(out, list) and len(out) > 0 and isinstance(out[0], tuple):
-                            results = out  # already (doc, score)
-                        elif isinstance(out, list) and len(out) > 0 and hasattr(out[0], "page_content"):
-                            # no scores returned -> compute similarity (approx) by re-embedding checks (expensive)
-                            # we'll fake a descending order by returning in same order and set score to None
-                            results = [(d, None) for d in out[:top_k]]
-                        else:
-                            results = []
-                    break
-                except Exception as e:
-                    logger.debug("search method %s failed: %s", method_name, e)
-                    continue
-
-        if not results:
-            # fallback: brute-force compute cosine similarity against stored document embeddings if accessible
-            if hasattr(self.vectorstore, "get_embeddings"):
-                try:
-                    stored = self.vectorstore.get_embeddings()
-                    # get_embeddings -> list of (id, vector, metadata?) - unknown shape; skip for now
-                except Exception:
-                    pass
-            logger.warning("Vector store didn't return results via known APIs; returning empty list")
-            return []
-
-        # If filters provided, apply simple metadata filtering
-        docs_and_scores = []
-        for doc, score in results:
-            docs_and_scores.append((doc, score))
+        # Perform similarity search
+        results = self.vector_store.similarity_search(query, k=k*3)  # Get more to filter
+        
+        # Apply filters if provided
         if filters:
-            filtered = self._filter_candidates([d for d, s in docs_and_scores], filters)
-            docs_and_scores = [(d, s) for d, s in docs_and_scores if d in filtered]
+            filtered_results = []
+            for doc in results:
+                # Duration filter
+                if 'max_duration' in filters:
+                    if doc.metadata['duration'] > filters['max_duration']:
+                        continue
+                
+                if 'min_duration' in filters:
+                    if doc.metadata['duration'] < filters['min_duration']:
+                        continue
+                
+                # Tags filter
+                if 'tags' in filters:
+                    tags_lower = doc.metadata['tags'].lower()
+                    filter_tags = filters['tags'].lower()
+                    if filter_tags not in tags_lower:
+                        continue
+                
+                # Calories filter
+                if 'max_calories' in filters:
+                    if doc.metadata['calories'] > filters['max_calories']:
+                        continue
+                
+                # Protein filter
+                if 'min_protein' in filters:
+                    if doc.metadata['protein'] < filters['min_protein']:
+                        continue
+                
+                filtered_results.append(doc)
+                
+                # Stop when we have enough results
+                if len(filtered_results) >= k:
+                    break
+            
+            return filtered_results[:k]
+        
+        return results[:k]
+    
+    def format_context(self, docs):
+        """Format retrieved documents into context string"""
+        context_parts = []
+        for i, doc in enumerate(docs, 1):
+            context_parts.append(f"""
+Recipe {i}:
+Title: {doc.metadata['title']}
+Duration: {doc.metadata['duration']} minutes
+Calories: {doc.metadata['calories']} cal
+Protein: {doc.metadata['protein']}g
+Serves: {doc.metadata['serves']}
+Tags: {doc.metadata['tags']}
+Details: {doc.page_content[:300]}...
+""")
+        return "\n".join(context_parts)
+    
+    def generate_response(self, query, context):
+        """Generate natural language response using LLM"""
+        prompt_template = ChatPromptTemplate.from_template("""
+You are a helpful recipe recommendation assistant. Based on the user's query and the retrieved recipes below, provide a natural, conversational recommendation.
 
-        # Keep only top_k
-        docs_and_scores = docs_and_scores[:top_k]
-        logger.info("Retrieved %d candidates after filtering", len(docs_and_scores))
-        return docs_and_scores
+User Query: {query}
 
-    def _format_context_from_docs(self, docs_with_scores: List[Tuple[Document, float]]) -> str:
-        """Build a concise context string from retrieved docs to pass to the LLM"""
-        parts = []
-        for i, (doc, score) in enumerate(docs_with_scores, start=1):
-            meta = doc.metadata or {}
-            title = meta.get("title", f"Recipe #{i}")
-            duration = meta.get("duration", "unknown")
-            tags = meta.get("tags", [])
-            calories = meta.get("calories", None)
-            snippet = doc.page_content
-            header = f"{i}. {title} ({duration} min){', ' + str(calories) + ' cal' if calories else ''}"
-            parts.append(header)
-            # include a short snippet (first 200 chars)
-            parts.append(snippet[:400])
-            if score is not None:
-                parts.append(f"[similarity_score: {score}]")
-            parts.append("")  # blank line between entries
-        return "\n".join(parts)
+Retrieved Recipes:
+{context}
 
-    def generate_answer(self,
-                        query: str,
-                        docs_with_scores: List[Tuple[Document, float]],
-                        max_recipes_to_show: int = 5) -> str:
-        """
-        Generate a user-facing answer: LLM is given the retrieved recipes as context and asked to recommend.
-        """
-        context = self._format_context_from_docs(docs_with_scores[:max_recipes_to_show])
+Instructions:
+- Recommend the most suitable recipes based on the query
+- Mention key details like duration, calories, and why each recipe fits
+- Be concise but informative
+- Use a friendly, conversational tone
+- If no recipes match well, explain why and suggest alternatives
 
-        prompt_template = PromptTemplate(
-            input_variables=["query", "context"],
-            template=(
-                "You are a helpful culinary assistant. A user asks: \"{query}\".\n\n"
-                "Here are candidate recipes that match the query (each recipe includes title, duration, tags, and a short snippet):\n\n"
-                "{context}\n\n"
-                "Task: produce a concise, friendly recommendation message for the user. Include:\n"
-                "- A short summary sentence with 2-4 recommended recipes (title, duration, calories if available) matching the request.\n"
-                "- Why each recommendation matches (1 short reason each).\n"
-                "- If none match perfectly, provide the best alternatives and explain why.\n\n"
-                "Output only the recommendation text (no JSON or extra commentary)."
-            )
+Your Response:
+""")
+        
+        # Create chain
+        chain = (
+            {"query": RunnablePassthrough(), "context": RunnablePassthrough()}
+            | prompt_template
+            | self.llm
+            | StrOutputParser()
         )
-
-        prompt = prompt_template.format(query=query, context=context)
-
-        logger.info("Invoking LLM to generate answer")
-        # Ollama wrapper's .invoke may return a string or dict-like; handle both
-        response = self.llm.invoke(prompt)
-        if isinstance(response, dict) and "text" in response:
-            answer = response["text"].strip()
-        else:
-            answer = str(response).strip()
-        return answer
+        
+        # Generate response
+        response = chain.invoke({"query": query, "context": context})
+        return response
+    
+    def query(self, user_query, k=5, filters=None):
+        """
+        Complete RAG pipeline
+        
+        Args:
+            user_query: Natural language query from user
+            k: Number of recipes to retrieve
+            filters: Optional filters dictionary
+        
+        Returns:
+            Natural language response
+        """
+        print(f"\nProcessing query: '{user_query}'")
+        print(f"Filters: {filters}")
+        
+        # Step 1: Retrieve top-k recipes
+        print(f"\nRetrieving top-{k} recipes...")
+        retrieved_docs = self.retrieve_recipes(user_query, k=k, filters=filters)
+        
+        if not retrieved_docs:
+            return "I couldn't find any recipes matching your criteria. Try adjusting your filters or query."
+        
+        print(f"Retrieved {len(retrieved_docs)} recipes")
+        
+        # Step 2: Format context
+        context = self.format_context(retrieved_docs)
+        
+        # Step 3: Generate response using LLM
+        print("Generating response...")
+        response = self.generate_response(user_query, context)
+        
+        return response
 
 
 # Example usage
-def main_example(csv_path: str):
-    """
-    Demonstrate full pipeline:
-     - load CSV
-     - index recipes
-     - run an example query with metadata filtering (vegetarian under 20 minutes)
-    """
-    rag = RecipeRAG(csv_path=csv_path)
-
-    # Load and index
-    recipes = rag.load_csv()
-    logger.info("Indexing recipes... this may take a while depending on model speed")
-    indexed_count = rag.index_recipes(recipes)
-    logger.info("Indexed %d recipes into in-memory store", indexed_count)
-
-    # Example query
-    query = "Suggest a quick vegetarian dinner under 20 minutes."
-    # Filters for our simple metadata filter: duration_lt and tag_in
-    filters = {"duration_lt": 20, "tag_in": "vegetarian"}
-
-    retrieved = rag.retrieve(query=query, top_k=8, filters=filters)
-    if not retrieved:
-        print("No matching recipes were retrieved for the given filters/query.")
-        return
-
-    answer = rag.generate_answer(query, retrieved, max_recipes_to_show=5)
-    print("\n===== Recommendation Answer =====\n")
-    print(answer)
-    print("\n===== Retrieved Candidates (debug) =====\n")
-    for doc, score in retrieved:
-        print("Title:", doc.metadata.get("title"))
-        print("Duration:", doc.metadata.get("duration"))
-        print("Tags:", doc.metadata.get("tags"))
-        print("Score:", score)
-        print("---")
-
-
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Recipe RAG demo")
-    parser.add_argument("--csv", type=str, default="./data/hummus_recipes_preprocessed.csv", help="Path to recipes CSV")
-    args = parser.parse_args()
-
-    # Quick sanity check for CSV path
-    if not os.path.exists(args.csv):
-        logger.error("CSV file not found: %s. Please provide a valid CSV path.", args.csv)
-        exit(1)
-
-    main_example(args.csv)
+    # Initialize the RAG system
+    csv_path = "data/hummus_recipes_preprocessed.csv" 
+    rag = RecipeRAGSystem(csv_path)
+    
+    # Example Query 1: Quick vegetarian dinner
+    print("\n" + "="*80)
+    print("EXAMPLE 1: Quick vegetarian dinner")
+    print("="*80)
+    
+    query1 = "Suggest a quick vegetarian dinner under 20 minutes."
+    filters1 = {
+        'max_duration': 20,
+        'tags': 'vegetarian'
+    }
+    
+    response1 = rag.query(query1, k=3, filters=filters1)
+    print("\n" + response1)
+    
+    # Example Query 2: High protein breakfast
+    print("\n" + "="*80)
+    print("EXAMPLE 2: High protein breakfast")
+    print("="*80)
+    
+    query2 = "I need a high protein breakfast recipe"
+    filters2 = {
+        'min_protein': 15,
+        'max_duration': 30
+    }
+    
+    response2 = rag.query(query2, k=3, filters=filters2)
+    print("\n" + response2)
+    
+    # Example Query 3: Low calorie lunch
+    print("\n" + "="*80)
+    print("EXAMPLE 3: Low calorie lunch")
+    print("="*80)
+    
+    query3 = "What's a healthy low calorie lunch option?"
+    filters3 = {
+        'max_calories': 400
+    }
+    
+    response3 = rag.query(query3, k=3, filters=filters3)
+    print("\n" + response3)
+    
+    # Example Query 4: No filters
+    print("\n" + "="*80)
+    print("EXAMPLE 4: General pasta query")
+    print("="*80)
+    
+    query4 = "Show me some pasta recipes"
+    response4 = rag.query(query4, k=3)
+    print("\n" + response4)
