@@ -33,16 +33,19 @@ except ImportError:
 # 1. Device check and model setup
 # -------------------------------------------------
 def setup_device_and_model(model_name="sentence-transformers/all-MiniLM-L6-v2"):
-    """ Checks GPU availability and loads the Sentence-BERT model."""
+    """Checks GPU availability (CUDA or MPS) and loads the Sentence-BERT model."""
     if torch.cuda.is_available():
         device = "cuda"
-        print(f"✅ GPU detected: {torch.cuda.get_device_name(0)}")
+        print(f"✅ NVIDIA GPU detected: {torch.cuda.get_device_name(0)}")
+    elif torch.backends.mps.is_available():
+        device = "mps"
+        print("🍏 Apple GPU (MPS) detected — using Metal acceleration")
     else:
         device = "cpu"
         print("⚠️ No GPU detected, using CPU")
 
     model = SentenceTransformer(model_name, device=device)
-    print(f"Loaded model: {model_name} on {device.upper()}")
+    print(f"✅ Loaded model: {model_name} on {device.upper()}")
     return model, device
 
 
