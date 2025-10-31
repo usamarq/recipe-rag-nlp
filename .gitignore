@@ -24,3 +24,4 @@ __pycache__/
 .vscode/
 # PyCharm
 .idea/
+faiss_recipe_index/
