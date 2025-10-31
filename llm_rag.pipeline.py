@@ -1,17 +1,19 @@
 import pandas as pd
 from langchain_community.embeddings import OllamaEmbeddings
 from langchain_community.llms import Ollama
-from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 import warnings
+import os  # Import the os module
+
 warnings.filterwarnings('ignore')
 
 
 class RecipeRAGSystem:
-    def __init__(self, csv_path, embedding_model="nomic-embed-text:latest", llm_model="llama3.1:latest"):
+    def __init__(self, csv_path, embedding_model="nomic-embed-text:latest", llm_model="llama3.1:latest", vector_store_path="faiss_recipe_index"):
         """
         Initialize the Recipe RAG System
         
@@ -19,39 +21,54 @@ class RecipeRAGSystem:
             csv_path: Path to the CSV file containing recipes
             embedding_model: Ollama embedding model name
             llm_model: Ollama LLM model name
+            vector_store_path: Path to save/load the FAISS index
         """
         self.csv_path = csv_path
         self.embedding_model = embedding_model
         self.llm_model = llm_model
+        self.vector_store_path = vector_store_path
         
         # Initialize components
-        print("Initializing embeddings...")
+        print("Initializing embeddings (this will use the M1 GPU via Ollama)...")
         self.embeddings = OllamaEmbeddings(model=self.embedding_model)
         
-        print("Initializing LLM...")
+        print("Initializing LLM (this will use the M1 GPU via Ollama)...")
         self.llm = Ollama(model=self.llm_model, temperature=0.7)
         
-        # Load and process data
-        print("Loading recipe data...")
-        self.df = pd.read_csv(csv_path)
-        self.process_data()
-        
-        # Create vector store
-        print("Creating vector store...")
-        self.vector_store = self.create_vector_store()
+        # *** CHANGED: Load or create vector store ***
+        if os.path.exists(self.vector_store_path):
+            print(f"Loading existing vector store from {self.vector_store_path}...")
+            # We must pass allow_dangerous_deserialization=True for FAISS
+            self.vector_store = FAISS.load_local(
+                self.vector_store_path, 
+                self.embeddings,
+                allow_dangerous_deserialization=True 
+            )
+        else:
+            print("No existing vector store found. Creating a new one...")
+            # Load and process data
+            print("Loading recipe data...")
+            self.df = pd.read_csv(csv_path)
+            self.process_data()
+            
+            # Create vector store
+            print("Creating vector store (embedding documents)...")
+            self.vector_store = self.create_vector_store()
+            
+            # *** ADDED: Save the new vector store ***
+            print(f"Saving new vector store to {self.vector_store_path}...")
+            self.vector_store.save_local(self.vector_store_path)
         
         print("RAG System initialized successfully!")
-    
+
+    # ... (process_data and create_document_text methods are unchanged) ...
     def process_data(self):
         """Clean and process the recipe data"""
-        # Handle missing values
         self.df['description'] = self.df['description'].fillna('')
         self.df['tags'] = self.df['tags'].fillna('')
         self.df['duration'] = pd.to_numeric(self.df['duration'], errors='coerce')
         self.df['calories_cal'] = pd.to_numeric(self.df['calories_cal'], errors='coerce')
         self.df['protein_g'] = pd.to_numeric(self.df['protein_g'], errors='coerce')
-        
-        # Drop rows with missing critical data
         self.df = self.df.dropna(subset=['title', 'duration'])
     
     def create_document_text(self, row):
@@ -68,16 +85,14 @@ Serves: {row['serves']}
 Directions: {row['directions'][:200] if pd.notna(row['directions']) else 'N/A'}...
         """.strip()
         return doc_text
-    
+
+
     def create_vector_store(self):
         """Create vector store from recipe data"""
         documents = []
         
         for idx, row in self.df.iterrows():
-            # Create document text
             doc_text = self.create_document_text(row)
-            
-            # Create metadata
             metadata = {
                 'recipe_id': str(row['recipe_id']) if pd.notna(row['recipe_id']) else str(idx),
                 'title': str(row['title']),
@@ -87,72 +102,48 @@ Directions: {row['directions'][:200] if pd.notna(row['directions']) else 'N/A'}.
                 'protein': float(row['protein_g']) if pd.notna(row['protein_g']) else 0,
                 'serves': str(row['serves']) if pd.notna(row['serves']) else 'N/A',
             }
-            
-            # Create document
             doc = Document(page_content=doc_text, metadata=metadata)
             documents.append(doc)
         
-        # Create vector store
-        vector_store = InMemoryVectorStore.from_documents(
+        print(f"Embedding {len(documents)} documents. This may take a moment...")
+        vector_store = FAISS.from_documents(
             documents=documents,
             embedding=self.embeddings
         )
         
         return vector_store
-    
+
+    # ... (all other methods like retrieve_recipes, format_context, etc. are unchanged) ...
     def retrieve_recipes(self, query, k=5, filters=None):
         """
         Retrieve top-k recipes based on query
-        
-        Args:
-            query: User query string
-            k: Number of recipes to retrieve
-            filters: Dictionary of filters (e.g., {'max_duration': 20, 'tags': 'vegetarian'})
-        
-        Returns:
-            List of retrieved documents
         """
-        # Perform similarity search
         results = self.vector_store.similarity_search(query, k=k*3)  # Get more to filter
         
-        # Apply filters if provided
         if filters:
             filtered_results = []
             for doc in results:
-                # Duration filter
                 if 'max_duration' in filters:
                     if doc.metadata['duration'] > filters['max_duration']:
                         continue
-                
                 if 'min_duration' in filters:
                     if doc.metadata['duration'] < filters['min_duration']:
                         continue
-                
-                # Tags filter
                 if 'tags' in filters:
                     tags_lower = doc.metadata['tags'].lower()
                     filter_tags = filters['tags'].lower()
                     if filter_tags not in tags_lower:
                         continue
-                
-                # Calories filter
                 if 'max_calories' in filters:
                     if doc.metadata['calories'] > filters['max_calories']:
                         continue
-                
-                # Protein filter
                 if 'min_protein' in filters:
                     if doc.metadata['protein'] < filters['min_protein']:
                         continue
-                
                 filtered_results.append(doc)
-                
-                # Stop when we have enough results
                 if len(filtered_results) >= k:
                     break
-            
             return filtered_results[:k]
-        
         return results[:k]
     
     def format_context(self, docs):
@@ -190,35 +181,22 @@ Instructions:
 
 Your Response:
 """)
-        
-        # Create chain
         chain = (
             {"query": RunnablePassthrough(), "context": RunnablePassthrough()}
             | prompt_template
             | self.llm
             | StrOutputParser()
         )
-        
-        # Generate response
         response = chain.invoke({"query": query, "context": context})
         return response
     
     def query(self, user_query, k=5, filters=None):
         """
         Complete RAG pipeline
-        
-        Args:
-            user_query: Natural language query from user
-            k: Number of recipes to retrieve
-            filters: Optional filters dictionary
-        
-        Returns:
-            Natural language response
         """
         print(f"\nProcessing query: '{user_query}'")
         print(f"Filters: {filters}")
         
-        # Step 1: Retrieve top-k recipes
         print(f"\nRetrieving top-{k} recipes...")
         retrieved_docs = self.retrieve_recipes(user_query, k=k, filters=filters)
         
@@ -227,15 +205,12 @@ Your Response:
         
         print(f"Retrieved {len(retrieved_docs)} recipes")
         
-        # Step 2: Format context
         context = self.format_context(retrieved_docs)
         
-        # Step 3: Generate response using LLM
-        print("Generating response...")
+        print("Generating response (using M1 GPU via Ollama)...")
         response = self.generate_response(user_query, context)
         
         return response
-
 
 # Example usage
 if __name__ == "__main__":
