@@ -25,3 +25,5 @@ __pycache__/
 # PyCharm
 .idea/
 faiss_recipe_index/
+*.pkl
+*.faiss
