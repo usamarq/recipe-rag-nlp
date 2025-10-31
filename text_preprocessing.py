@@ -7,22 +7,22 @@ from nltk.tokenize import word_tokenize
 import ast # Added ast here as well, though not used in preprocess_text
 
 # # --- NLTK Resource Download Check/Setup ---
-# # It's good practice to ensure resources are available
-# try:
-#     stopwords.words('english')
-# except LookupError:
-#     print("NLTK stopwords not found. Downloading...")
-#     nltk.download('stopwords', quiet=True)
-# try:
-#     nltk.data.find('tokenizers/punkt')
-# except LookupError:
-#     print("NLTK punkt tokenizer not found. Downloading...")
-#     nltk.download('punkt', quiet=True)
-# try:
-#     nltk.data.find('corpora/wordnet')
-# except LookupError:
-#     print("NLTK wordnet not found. Downloading...")
-#     nltk.download('wordnet', quiet=True)
+# It's good practice to ensure resources are available
+try:
+    stopwords.words('english')
+except LookupError:
+    print("NLTK stopwords not found. Downloading...")
+    nltk.download('stopwords', quiet=True)
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    print("NLTK punkt tokenizer not found. Downloading...")
+    nltk.download('punkt', quiet=True)
+try:
+    nltk.data.find('corpora/wordnet')
+except LookupError:
+    print("NLTK wordnet not found. Downloading...")
+    nltk.download('wordnet', quiet=True)
 # # ----------------------------------------------
 
 
