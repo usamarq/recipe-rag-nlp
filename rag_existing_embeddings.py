@@ -77,7 +77,7 @@ warnings.filterwarnings('ignore')
 class RecipeRAGSystem:
     def __init__(self, csv_path, 
                  embedding_path="./data/recipe_embeddings.npy",
-                 llm_model="gpt-oss:20b", 
+                 llm_model="phi3:mini", 
                  vector_store_path="faiss_recipe_index_all-MiniLM-L6-v2"):
         """
         Initialize the Recipe RAG System

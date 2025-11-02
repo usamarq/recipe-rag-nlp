@@ -1,0 +1,6 @@
+{
+  "num_documents": 432834,
+  "created_at": "2025-11-02 20:03:27",
+  "csv_path": "data/hummus_recipes_preprocessed.csv",
+  "embedding_model": "sentence-transformers/all-MiniLM-L6-v2"
+}

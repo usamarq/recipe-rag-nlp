@@ -1,6 +1,7 @@
 import pandas as pd
-# --- MODIFIED: Import SentenceTransformer ---
+# --- MODIFIED: Import SentenceTransformer AND HuggingFaceEmbeddings wrapper ---
 from sentence_transformers import SentenceTransformer
+from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.llms import Ollama
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
@@ -47,8 +48,8 @@ class RecipeRAGSystem:
                  embedding_model_name="sentence-transformers/all-MiniLM-L6-v2", 
                  llm_model="phi3:mini", 
                  vector_store_path="faiss_recipe_index_minilm", # New Path for MiniLM
-                 force_rebuild=False, 
-                 batch_size=96): # Not used for building, but kept for consistency
+                 force_rebuild=False,
+                 batch_size=96):
         """
         Initialize the Recipe RAG System using pre-computed .npy embeddings.
         """
@@ -63,22 +64,42 @@ class RecipeRAGSystem:
         print("Initializing Recipe RAG System (MiniLM .npy + Query Parsing)")
         print("="*80)
         
-        # --- MODIFIED: Load SentenceTransformer for QUERYING ---
+        # --- MODIFIED: Load SentenceTransformer and WRAP it for LangChain ---
         print(f"\n[1/3] Initializing embeddings model ({self.embedding_model_name})...")
         start_time = time.time()
         if torch.cuda.is_available():
-            self.device = "cuda"
+            device = "cuda"
             print(f"   ✓ Embedding: Found CUDA GPU: {torch.cuda.get_device_name(0)}")
         elif torch.backends.mps.is_available():
-            self.device = "mps"
+            device = "mps"
             print("   ✓ Embedding: Found Apple Silicon GPU (MPS).")
         else:
-            self.device = "cpu"
+            device = "cpu"
             print("   ⚠️ Embedding: No GPU detected, using CPU.")
         
-        # This model is for embedding the QUERY at search time
-        self.embeddings_model = SentenceTransformer(self.embedding_model_name, device=self.device)
-        print(f"   ✓ Query Embeddings model loaded on {self.device} in {time.time() - start_time:.2f}s")
+        # Load the base SentenceTransformer model
+        raw_model = SentenceTransformer(self.embedding_model_name, device=device)
+        
+        # Wrap it in LangChain's HuggingFaceEmbeddings wrapper
+        # This wrapper provides the .embed_query() method
+        self.embeddings_model = HuggingFaceEmbeddings(
+            model_name=self.embedding_model_name, # Can also pass model_kwargs
+            model_kwargs={'device': device},
+            encode_kwargs={'normalize_embeddings': True} # Ensure normalization
+        )
+        # We pass the raw model's encode function to the wrapper for from_embeddings
+        # This is a workaround to use the pre-loaded SentenceTransformer object
+        # A cleaner way is to just let HuggingFaceEmbeddings handle it.
+        
+        # --- Let's simplify: Just use HuggingFaceEmbeddings directly ---
+        print(f"   Initializing LangChain embedding wrapper for: {self.embedding_model_name} on device: {device}...")
+        self.embeddings = HuggingFaceEmbeddings(
+            model_name=self.embedding_model_name,
+            model_kwargs={'device': device},
+            encode_kwargs={'normalize_embeddings': True} # Ensure this matches .npy creation
+        )
+        
+        print(f"   ✓ Query Embeddings model loaded in {time.time() - start_time:.2f}s")
         # -----------------------------------------------------------------
         
         print(f"\n[2/3] Initializing LLM ({self.llm_model} via Ollama)...")
@@ -105,7 +126,7 @@ class RecipeRAGSystem:
             
             self.vector_store = FAISS.load_local(
                 self.vector_store_path, 
-                self.embeddings_model, # Use the SentenceTransformer object
+                self.embeddings, # Use the LangChain wrapper object
                 allow_dangerous_deserialization=True
             )
             
@@ -115,7 +136,6 @@ class RecipeRAGSystem:
             print(f"   ✓ Loaded {metadata.get('num_documents', 'N/A')} documents in {time.time() - start_time:.2f}s")
             print(f"   ✓ Index created: {metadata.get('created_at', 'N/A')}")
             
-            # --- Load metadata_map from FAISS for filtering ---
             print("   Loading metadata map from index for filtering...")
             try:
                 self.metadata_map = {i: self.vector_store.docstore.search(self.vector_store.index_to_docstore_id[i]).metadata 
@@ -138,7 +158,6 @@ class RecipeRAGSystem:
         print("   Loading recipe data (for metadata)...")
         start_time = time.time()
         
-        # Load all columns needed for filtering and display
         all_needed_cols = [
             'recipe_id', 'title', 'description', 'duration', 'tags', 
             'processed_tags', 'ingredients', 
@@ -170,13 +189,12 @@ class RecipeRAGSystem:
         self.df = df_raw.copy()
         self.process_data() # Cleans and filters self.df in place
         
-        kept_indices = self.df.index # Get indices of rows that were *kept*
+        kept_indices = self.df.index 
         print(f"   ✓ Processed {len(self.df)} valid recipes in {time.time() - start_time:.2f}s")
         
-        # --- Filter embeddings to match the filtered dataframe ---
         print(f"   Filtering embeddings from {len(precomputed_embeddings)} to {len(kept_indices)}...")
         embeddings_processed = precomputed_embeddings[kept_indices]
-        del precomputed_embeddings, df_raw # Free memory
+        del precomputed_embeddings, df_raw 
 
         print("   Preparing (document, embedding) pairs and metadata...")
         text_embeddings_list = []
@@ -184,14 +202,10 @@ class RecipeRAGSystem:
         self.metadata_map = {}
         
         doc_index_counter = 0
-        # Iterate over the *filtered* dataframe (self.df)
-        for _, row in tqdm(self.df.iterrows(), total=len(self.df), desc="   Creating Documents"):
+        for (_, row), emb in tqdm(zip(self.df.iterrows(), embeddings_processed), total=len(self.df), desc="   Creating Documents"):
             
-            # Text for LLM context (pretty, raw text)
             doc_text_for_llm = self.create_llm_context_text(row) 
-            
-            # Get the pre-computed embedding
-            emb = embeddings_processed[doc_index_counter]
+            emb_vector = emb.tolist() # The pre-computed vector
 
             tags_for_meta = []
             tags_data = row.get('processed_tags', "[]")
@@ -201,11 +215,10 @@ class RecipeRAGSystem:
             elif isinstance(tags_data, list):
                 tags_for_meta = tags_data
             
-            # Metadata for FAISS docstore AND internal filtering
             metadata = {
                 'recipe_id': str(row.get('recipe_id', str(doc_index_counter))),
                 'title': str(row.get('title', 'N/A')),
-                'llm_context_text': doc_text_for_llm, # Store the "pretty" text
+                'llm_context_text': doc_text_for_llm, 
                 'duration': float(row.get('duration', 0)),
                 'calories_cal': float(row.get('calories_cal', 0)),
                 'protein_g': float(row.get('protein_g', 0)),
@@ -218,27 +231,27 @@ class RecipeRAGSystem:
                 'sugars_g': float(row.get('sugars_g', 0)),
                 'ingredients_sizes': int(row.get('ingredients_sizes', 0)),
                 'direction_size': int(row.get('direction_size', 0)),
-                'tags_processed': [str(t).lower() for t in tags_for_meta], # Clean list for filtering
+                'tags_processed': [str(t).lower() for t in tags_for_meta], 
             }
             
-            # --- Use the "pretty" text for page_content, FAISS.from_embeddings will use the vector ---
-            text_embeddings_list.append((doc_text_for_llm, emb.tolist()))
+            # --- Use the "pretty" text for page_content ---
+            # FAISS.from_embeddings will pair this text with the pre-computed vector
+            text_embeddings_list.append((doc_text_for_llm, emb_vector))
             metadatas_list.append(metadata)
             
             self.metadata_map[doc_index_counter] = metadata
             doc_index_counter += 1
         
-        del embeddings_processed # Free memory
+        del embeddings_processed 
         del self.df
 
         print(f"   Creating vector store from {len(text_embeddings_list)} pre-computed embeddings...")
         start_time = time.time()
         
         # --- Use FAISS.from_embeddings ---
-        # This method takes pre-computed vectors and does not call the embedding model
         self.vector_store = FAISS.from_embeddings(
             text_embeddings=text_embeddings_list,
-            embedding=self.embeddings_model, # Pass the *query* embedder
+            embedding=self.embeddings, # Pass the LangChain *wrapper* object
             metadatas=metadatas_list
         )
         print(f"   ✓ Vector store created in {time.time() - start_time:.2f}s")
@@ -246,7 +259,6 @@ class RecipeRAGSystem:
         print(f"   Saving new vector store to {self.vector_store_path}...")
         self.vector_store.save_local(self.vector_store_path)
 
-        # Save metadata JSON
         metadata_json = {
             'num_documents': len(metadatas_list),
             'created_at': time.strftime('%Y-%m-%d %H:%M:%S'),
@@ -283,14 +295,12 @@ class RecipeRAGSystem:
             if col in self.df.columns:
                  self.df[col] = pd.to_numeric(self.df[col], errors='coerce')
         
-        # Drop only if title is missing
         drop_subset_existing = ['title'] 
         self.df = self.df.dropna(subset=drop_subset_existing)
         
-        # FillNa for numeric columns *after* dropping
         for col in numeric_cols:
              if col in self.df.columns:
-                 self.df[col] = self.df[col].fillna(0) # Fill remaining NaNs with 0
+                 self.df[col] = self.df[col].fillna(0)
                  if col in ['duration', 'ingredients_sizes', 'direction_size']:
                       self.df[col] = self.df[col].astype(int)
                  else:
@@ -323,7 +333,7 @@ Directions: {str(row.get('directions', 'N/A'))[:200]}...
         return doc_text
 
     # --- REMOVED: create_document_text_for_embedding ---
-    # Not needed, we load from .npy file
+    # This logic is now in `retrieve_recipes` for the query
 
     # --- REMOVED: _create_vector_store_with_progress ---
     # Replaced by logic in _load_or_create_vector_store
@@ -407,35 +417,13 @@ Directions: {str(row.get('directions', 'N/A'))[:200]}...
         k_retrieval = max(k * 10, 50) 
         print(f"   Retrieving {k_retrieval} candidates *before* filtering...")
         try:
-            # --- MODIFIED: Use self.embeddings_model.encode to get query vector ---
-            query_vector = self.embeddings_model.encode([processed_query_for_embedding], 
-                                                        normalize_embeddings=True, # Match your .npy creation
-                                                        show_progress_bar=False)
-            
-            # --- MODIFIED: Use FAISS.similarity_search_by_vector ---
-            # This is the correct way to query FAISS with an external vector
-            scores, indices = self.vector_store.index.search(query_vector.astype(np.float32), k_retrieval)
-            
-            # Manually reconstruct the (doc, score) list
-            results_with_scores = []
-            for i, idx in enumerate(indices[0]):
-                 if idx == -1: continue # FAISS can return -1 for no more neighbors
-                 doc = self.vector_store.docstore.search(self.vector_store.index_to_docstore_id[idx])
-                 # FAISS returns distances (L2) by default, not similarity. 
-                 # If embeddings were normalized, L2 distance can be converted to cosine similarity
-                 # or we can just rank by distance (lower is better)
-                 # For MiniLM (normalized), cosine_sim = 1 - (L2_dist^2 / 2)
-                 # Let's use distance (lower is better) for now, or just rank by order.
-                 # Let's stick to similarity_search_with_score for simplicity, which *should*
-                 # use the embedder.
-            
-            # --- REVERTING to similarity_search_with_score (simpler) ---
-            # This relies on FAISS.load_local correctly using self.embeddings_model
+            # --- MODIFIED: Use similarity_search_with_score ---
+            # This will use the self.embeddings (HuggingFaceEmbeddings wrapper)
+            # to embed the query string.
             results_with_scores = self.vector_store.similarity_search_with_score(
                 processed_query_for_embedding, # Use query *without* prefix
                 k=k_retrieval
             )
-            # -----------------------------------------------------------
 
         except Exception as e:
             print(f"   ❌ Error during FAISS similarity search: {e}")
@@ -599,7 +587,7 @@ if __name__ == "__main__":
         csv_path, 
         embedding_path=embedding_path,
         embedding_model_name="sentence-transformers/all-MiniLM-L6-v2", # --- MODIFIED ---
-        llm_model="phi3:mini", 
+        llm_model="llama3.1:latest", 
         vector_store_path="faiss_recipe_index_minilm", # --- MODIFIED: New Path ---
         force_rebuild=False,  # <-- SET TO TRUE ONCE TO REBUILD!
         batch_size=96 

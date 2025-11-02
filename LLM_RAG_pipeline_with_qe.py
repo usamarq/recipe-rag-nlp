@@ -563,7 +563,7 @@ if __name__ == "__main__":
     
     rag = RecipeRAGSystem(
         csv_path, 
-        embedding_model="minilm-l6-v2:latest", # BERT for embeddings
+        embedding_model="all-minilm:latest", # BERT for embeddings
         llm_model="phi3:mini", # Phi-3 for generation
         vector_store_path="faiss_recipe_index_qe", # Use a new path for the bert and qe index
         force_rebuild=False,  # Change to True ONCE to build the Nomic index
