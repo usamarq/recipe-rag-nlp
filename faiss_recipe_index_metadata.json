@@ -1,0 +1,6 @@
+{
+  "num_documents": 427867,
+  "created_at": "2025-10-31 23:26:54",
+  "csv_path": "data/hummus_recipes_preprocessed.csv",
+  "embedding_model": "nomic-embed-text:latest"
+}
