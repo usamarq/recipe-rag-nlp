@@ -78,7 +78,7 @@ class RecipeRAGSystem:
     def __init__(self, csv_path, 
                  embedding_path="./data/recipe_embeddings.npy",
                  llm_model="gpt-oss:20b", 
-                 vector_store_path="faiss_recipe_index"):
+                 vector_store_path="faiss_recipe_index_all-MiniLM-L6-v2"):
         """
         Initialize the Recipe RAG System
         """
@@ -93,7 +93,7 @@ class RecipeRAGSystem:
             model_name="sentence-transformers/all-MiniLM-L6-v2"
         )
         
-        print("Initializing LLM (this will use the M1 GPU via Ollama)...")
+        print("Initializing LLM (this will use the GPU via Ollama)...")
         self.llm = Ollama(model=self.llm_model, temperature=0.7)
         
         # Load or create vector store
