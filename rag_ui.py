@@ -237,7 +237,7 @@ if st.session_state.results:
                     # Display first few tags
                     tag_list = tags.split(',')[:3]
                     for tag in tag_list:
-                        st.markdown(f"<span style='background-color: #fff3cd; padding: 3px 8px; border-radius: 3px; margin-right: 5px; font-size: 12px;'>🏷️ {tag.strip()}</span>", unsafe_allow_html=True)
+                        st.markdown(f"<span style='background-color: #000000; padding: 3px 8px; border-radius: 3px; margin-right: 5px; font-size: 12px;'>🏷️ {tag.strip()}</span>", unsafe_allow_html=True)
             
             # Expandable section for full details
             with st.expander("View Full Recipe Details"):
