@@ -44,7 +44,7 @@ class RecipeRAGSystem:
     def __init__(self, csv_path, 
                  embedding_model="nomic-embed-text:latest", 
                  llm_model="llama3.1:latest", 
-                 vector_store_path="faiss_recipe_index",
+                 vector_store_path="faiss_recipe_index_nomic",
                  force_rebuild=False, 
                  batch_size=50):
         """
