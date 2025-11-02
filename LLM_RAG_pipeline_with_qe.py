@@ -563,9 +563,9 @@ if __name__ == "__main__":
     
     rag = RecipeRAGSystem(
         csv_path, 
-        embedding_model="nomic-embed-text:latest", # Nomic for embeddings
+        embedding_model="minilm-l6-v2:latest", # BERT for embeddings
         llm_model="phi3:mini", # Phi-3 for generation
-        vector_store_path="faiss_recipe_index_nomic", # Use a new path for the Nomic index
+        vector_store_path="faiss_recipe_index_qe", # Use a new path for the bert and qe index
         force_rebuild=False,  # Change to True ONCE to build the Nomic index
         batch_size=32 # Nomic can be slower, a smaller batch might be safer
     )
