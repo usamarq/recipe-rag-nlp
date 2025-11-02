@@ -7,7 +7,7 @@ from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
-from langchain_community.embeddings.base import Embeddings
+from langchain_core.embeddings import Embeddings
 import warnings
 import os
 import numpy as np
