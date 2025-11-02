@@ -1,57 +1,82 @@
 import pandas as pd
-from langchain_community.embeddings import OllamaEmbeddings
+from sentence_transformers import SentenceTransformer
+import torch
 from langchain_community.llms import Ollama
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
+from langchain_community.embeddings.base import Embeddings
 import warnings
 import os
 import numpy as np
-import ast  # *** NEW: Needed to parse list strings ***
-import re   # *** NEW: Added for preprocess_text ***
+import re
 import nltk
 
-# *** NEW: Copied the preprocess_text fallback from your embedding script ***
-# This is CRITICAL for matching query processing to document processing
+# Custom Embeddings wrapper for Sentence Transformers
+class SentenceTransformerEmbeddings(Embeddings):
+    """Wrapper to make SentenceTransformer compatible with LangChain"""
+    def __init__(self, model_name="sentence-transformers/all-MiniLM-L6-v2"):
+        # Check device
+        if torch.cuda.is_available():
+            self.device = "cuda"
+        elif torch.backends.mps.is_available():
+            self.device = "mps"
+        else:
+            self.device = "cpu"
+        
+        print(f"Loading SentenceTransformer on {self.device.upper()}...")
+        self.model = SentenceTransformer(model_name, device=self.device)
+    
+    def embed_documents(self, texts):
+        """Embed a list of documents"""
+        embeddings = self.model.encode(
+            texts,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+            show_progress_bar=False
+        )
+        return embeddings.tolist()
+    
+    def embed_query(self, text):
+        """Embed a single query"""
+        embedding = self.model.encode(
+            text,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+            show_progress_bar=False
+        )
+        return embedding.tolist()
+
+# Preprocessing function
 try:
-    # If you have this file, it's better
     from text_preprocessing import preprocess_text
 except ImportError:
     print("Warning: text_preprocessing.py not found. Using basic fallback for query processing.")
-    # Define a basic fallback
     from nltk.corpus import stopwords
     from nltk.stem import WordNetLemmatizer
     from nltk.tokenize import word_tokenize
-    import nltk
-    
-    # Ensure NLTK data is downloaded (you might need to run this once)
-    # nltk.download('punkt')
-    # nltk.download('wordnet')
-    # nltk.download('stopwords')
     
     lemmatizer = WordNetLemmatizer()
     stop_words = set(stopwords.words('english'))
+    
     def preprocess_text(text: str):
-        if not isinstance(text, str): return []
+        if not isinstance(text, str):
+            return []
         text = re.sub(r'[^a-zA-Z0-9\s]', ' ', text).lower()
         text = re.sub(r'(\d+)\s*(g|gram|ml|kg|tbsp|tsp|cup|cups|teaspoon|tablespoon|minute|min|hour|hr|cal|kcal)', r'\1\2', text)
         text = re.sub(r'\s+', ' ', text).strip()
         tokens = word_tokenize(text)
         cleaned = [lemmatizer.lemmatize(tok) for tok in tokens if tok not in stop_words and len(tok) > 1]
         return cleaned
-# *** END NEW SECTION ***
-
 
 warnings.filterwarnings('ignore')
 
 
 class RecipeRAGSystem:
     def __init__(self, csv_path, 
-                 embedding_path="./data/recipe_embeddings.npy", 
-                 # *** MODIFIED: Use the correct, matching model ***
-                 embedding_model="all-minilm:latest", 
+                 embedding_path="./data/recipe_embeddings.npy",
                  llm_model="gpt-oss:20b", 
                  vector_store_path="faiss_recipe_index"):
         """
@@ -59,17 +84,19 @@ class RecipeRAGSystem:
         """
         self.csv_path = csv_path
         self.embedding_path = embedding_path
-        self.embedding_model = embedding_model
         self.llm_model = llm_model
         self.vector_store_path = vector_store_path
         
-        print(f"Initializing embeddings with model: {self.embedding_model} (this will use the M1 GPU via Ollama)...")
-        self.embeddings = OllamaEmbeddings(model=self.embedding_model)
+        # Use SentenceTransformer embeddings (matching your embedding creation)
+        print("Initializing SentenceTransformer embeddings...")
+        self.embeddings = SentenceTransformerEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2"
+        )
         
         print("Initializing LLM (this will use the M1 GPU via Ollama)...")
         self.llm = Ollama(model=self.llm_model, temperature=0.7)
         
-        # *** MODIFIED: Load or create vector store ***
+        # Load or create vector store
         if os.path.exists(self.vector_store_path):
             print(f"Loading existing vector store from {self.vector_store_path}...")
             self.vector_store = FAISS.load_local(
@@ -86,20 +113,15 @@ class RecipeRAGSystem:
             if not os.path.exists(self.csv_path):
                 raise FileNotFoundError(f"Required CSV data file not found: {self.csv_path}.")
 
-            # --- MODIFIED LOGIC TO SYNC DATA ---
-            
-            # 1. Load RAW recipe data
+            # Load RAW recipe data
             print("Loading raw recipe data...")
-            # *** MODIFIED: Load all columns needed for metadata AND filtering ***
-            # We no longer need 'processed_...' columns here, just the raw text
-            # for the context and the filterable numeric/tag columns.
             df_raw = pd.read_csv(self.csv_path, low_memory=False)
             
-            # 2. Load pre-computed embeddings
+            # Load pre-computed embeddings
             print(f"Loading pre-computed embeddings from {self.embedding_path}...")
             precomputed_embeddings = np.load(self.embedding_path)
             
-            # 3. Sanity check: Compare RAW data length to embedding length
+            # Sanity check
             if len(df_raw) != len(precomputed_embeddings):
                 raise ValueError(
                     f"Embedding-Data Mismatch: The RAW CSV file has {len(df_raw)} rows, "
@@ -107,31 +129,27 @@ class RecipeRAGSystem:
                     "These files must correspond one-to-one."
                 )
 
-            # 4. Process the data to find out which rows to KEEP
+            # Process the data to find out which rows to KEEP
             print("Processing data to filter valid recipes...")
-            # We run process_data on a copy to get the filtered indices
-            self.df = df_raw.copy() # Set self.df to the copy
-            self.process_data()    # This will clean and drop rows from self.df
+            self.df = df_raw.copy()
+            self.process_data()
             
-            # 5. Get the indices of the rows that were KEPT
+            # Get the indices of the rows that were KEPT
             kept_indices = self.df.index
             
             print(f"Original data: {len(df_raw)} rows. Processed data: {len(self.df)} rows.")
             
-            # 6. Filter the original embeddings array to only the kept indices
+            # Filter the embeddings to match
             embeddings_processed = precomputed_embeddings[kept_indices]
 
             print("Preparing (document, embedding) pairs and metadata...")
             text_embeddings_list = []
             metadatas_list = []
             
-            # 7. Combine "Pretty" Text (for LLM) with "Processed" Embeddings (for retrieval)
+            # Combine "Pretty" Text with "Processed" Embeddings
             for (idx, row), emb in zip(self.df.iterrows(), embeddings_processed):
+                doc_text = self.create_document_text(row)
                 
-                # This is the "Pretty Text" for the LLM context
-                doc_text = self.create_document_text(row) 
-                
-                # This is the metadata for filtering
                 metadata = {
                     'recipe_id': str(row['recipe_id']) if pd.notna(row['recipe_id']) else str(idx),
                     'title': str(row['title']),
@@ -142,17 +160,13 @@ class RecipeRAGSystem:
                     'serves': str(row['serves']) if pd.notna(row['serves']) else 'N/A',
                 }
                 
-                # We pair the "Pretty Text" with its corresponding "Processed Embedding"
                 text_embeddings_list.append((doc_text, emb.tolist()))
                 metadatas_list.append(metadata)
             
-            # --- END MODIFIED LOGIC ---
-            
             print(f"Creating vector store from {len(text_embeddings_list)} pre-computed embeddings...")
-            # This uses the "Pretty Text" as page_content and the pre-computed vector as the embedding
             self.vector_store = FAISS.from_embeddings(
                 text_embeddings=text_embeddings_list,
-                embedding=self.embeddings,  # This is just to satisfy the interface
+                embedding=self.embeddings,
                 metadatas=metadatas_list
             )
             
@@ -161,7 +175,6 @@ class RecipeRAGSystem:
         
         print("RAG System initialized successfully!")
 
-
     def process_data(self):
         """Clean and process the recipe data"""
         self.df['description'] = self.df['description'].fillna('')
@@ -169,12 +182,10 @@ class RecipeRAGSystem:
         self.df['duration'] = pd.to_numeric(self.df['duration'], errors='coerce')
         self.df['calories_cal'] = pd.to_numeric(self.df['calories_cal'], errors='coerce')
         self.df['protein_g'] = pd.to_numeric(self.df['protein_g'], errors='coerce')
-        # This line is the key: it drops rows and updates self.df
         self.df = self.df.dropna(subset=['title', 'duration'])
     
     def create_document_text(self, row):
         """Create a rich text representation of a recipe for the LLM context"""
-        # This function creates the "pretty" text the LLM will see
         doc_text = f"""
 Title: {row['title']}
 Description: {row['description']}
@@ -188,12 +199,11 @@ Directions: {row['directions'][:200] if pd.notna(row['directions']) else 'N/A'}.
         """.strip()
         return doc_text
 
-    def retrieve_recipes(self, query, k=5, filters=None):
+    def retrieve_recipes(self, query, k=3, filters=None):
         """
         Retrieve top-k recipes based on query
         """
-        
-        # *** NEW: Preprocess the query to match the document embeddings ***
+        # Preprocess the query to match the document embeddings
         processed_query_tokens = preprocess_text(query)
         processed_query = " ".join(processed_query_tokens)
         print(f"   Original query: '{query}'")
@@ -204,7 +214,7 @@ Directions: {row['directions'][:200] if pd.notna(row['directions']) else 'N/A'}.
             return []
         
         # Search using the *processed* query
-        results = self.vector_store.similarity_search(processed_query, k=k*3)  # Get more to filter
+        results = self.vector_store.similarity_search(processed_query, k=k*3)
         
         if filters:
             filtered_results = []
@@ -236,7 +246,6 @@ Directions: {row['directions'][:200] if pd.notna(row['directions']) else 'N/A'}.
         """Format retrieved documents into context string"""
         context_parts = []
         for i, doc in enumerate(docs, 1):
-            # doc.page_content is now the "Pretty Text" we created
             context_parts.append(f"Recipe {i}:\n{doc.page_content}\n")
         return "\n".join(context_parts)
     
@@ -265,7 +274,6 @@ Your Response:
             | self.llm
             | StrOutputParser()
         )
-        # We pass the *original* user_query to the LLM, not the processed one
         response = chain.invoke({"query": query, "context": context})
         return response
     
@@ -277,7 +285,6 @@ Your Response:
         print(f"Filters: {filters}")
         
         print(f"\nRetrieving top-{k} recipes...")
-        # Pass the original user_query here. retrieve_recipes will handle processing.
         retrieved_docs = self.retrieve_recipes(user_query, k=k, filters=filters)
         
         if not retrieved_docs:
@@ -288,14 +295,14 @@ Your Response:
         context = self.format_context(retrieved_docs)
         
         print("Generating response (using M1 GPU via Ollama)...")
-        # Pass the original user_query to the LLM for context
         response = self.generate_response(user_query, context)
         
         return response
 
+
 # Example usage
 if __name__ == "__main__":
-    # Ensure NLTK data is available for the fallback
+    # Ensure NLTK data is available
     try:
         nltk.data.find('tokenizers/punkt')
     except LookupError:
@@ -312,15 +319,13 @@ if __name__ == "__main__":
         print("NLTK 'stopwords' not found. Downloading...")
         nltk.download('stopwords')
 
-
     csv_path = "data/hummus_recipes_preprocessed.csv" 
     embedding_path = "data/recipe_embeddings.npy"
     
-    # *** MODIFIED: Pass the correct embedding_model name ***
+    # Initialize with SentenceTransformer embeddings
     rag = RecipeRAGSystem(
         csv_path, 
-        embedding_path=embedding_path,
-        embedding_model="all-minilm:latest" # This must match your Ollama model
+        embedding_path=embedding_path
     )
     
     # Example Query 1: Quick vegetarian dinner
@@ -349,6 +354,7 @@ if __name__ == "__main__":
     }
     
     response2 = rag.query(query2, k=3, filters=filters2)
+    print("\n" + response2)
     
     # Example Query 3: Low calorie lunch
     print("\n" + "="*80)
