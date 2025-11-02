@@ -27,3 +27,4 @@ __pycache__/
 faiss_recipe_index/
 *.pkl
 *.faiss
+*.zip
